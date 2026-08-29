@@ -1,118 +1,96 @@
 const http = require('http');
 const net = require('net');
-const { WebSocketServer } = require('ws');
+const { WebSocketServer, createWebSocketStream } = require('ws');
 
-// 获取平台注入的端口，若无则默认 8000
-const port = process.env.PORT || 8000;
+// 1. 读取环境变量与配置
+const PORT = process.env.PORT || 8000;
+const UUID = (process.env.UUID || '9c5be7af-d13a-4a7f-9bd8-d0a13e99bcf5').replace(/-/g, '').toLowerCase();
 
-// 监听 0.0.0.0 保证外部网络能够通透
-server.listen(port, '0.0.0.0', () => {
-    console.log(`VLESS Node 正在运行于端口: ${port}`);
-});
-const RAW_UUID = process.env.UUID || 'd3b07384-d113-424a-a726-02232d00748b';
-const UUID = RAW_UUID.replaceAll('-', '');
-
+// 2. 先创建 HTTP 服务（提供健康检查，防止平台杀死进程）
 const server = http.createServer((req, res) => {
-  // 健康检查接口，供 PaaS 探测状态
-  if (req.url === '/health' || req.url === '/') {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('Hostless VLESS Node is Running!');
-  } else {
-    res.writeHead(404);
-    res.end();
-  }
+    if (req.url === '/' || req.url === '/health') {
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Hostless VLESS Node is Running!');
+    } else {
+        res.writeHead(404);
+        res.end();
+    }
 });
 
+// 3. 创建 WebSocket 服务
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws) => {
-  let tcpSocket = null;
+    ws.once('message', (chunk) => {
+        try {
+            const buffer = Buffer.from(chunk);
+            if (buffer.length < 18) return ws.close();
 
-  ws.on('message', (chunk) => {
-    // 若 TCP 连接已建立，后续数据直接透明转发
-    if (tcpSocket) {
-      tcpSocket.write(chunk);
-      return;
-    }
+            const version = buffer[0];
+            const reqUUID = buffer.subarray(1, 17).toString('hex').toLowerCase();
 
-    // 校验 VLESS 请求头部长度（最少 24 字节）
-    if (chunk.length < 24) return ws.close();
+            // 校验 UUID
+            if (reqUUID !== UUID) {
+                return ws.close();
+            }
 
-    const version = chunk[0];
-    const clientUUID = chunk.slice(1, 17).toString('hex');
+            const optLen = buffer[17];
+            let cursor = 18 + optLen;
 
-    // UUID 鉴权
-    if (clientUUID !== UUID) {
-      console.log('非法 UUID 访问');
-      return ws.close();
-    }
+            const command = buffer[cursor]; // 1: TCP
+            cursor += 1;
 
-    const addonsLen = chunk[17];
-    let cursor = 18 + addonsLen;
+            if (command !== 1) return ws.close();
 
-    const command = chunk[cursor]; // 1: TCP, 2: UDP
-    cursor += 1;
+            const remotePort = buffer.readUInt16BE(cursor);
+            cursor += 2;
 
-    const port = chunk.readUInt16BE(cursor);
-    cursor += 2;
+            const atyp = buffer[cursor];
+            cursor += 1;
 
-    const addrType = chunk[cursor]; // 1: IPv4, 2: Domain, 3: IPv6
-    cursor += 1;
+            let remoteHost = '';
+            if (atyp === 1) { // IPv4
+                remoteHost = buffer.subarray(cursor, cursor + 4).join('.');
+                cursor += 4;
+            } else if (atyp === 2) { // Domain
+                const domainLen = buffer[cursor];
+                cursor += 1;
+                remoteHost = buffer.subarray(cursor, cursor + domainLen).toString('utf-8');
+                cursor += domainLen;
+            } else if (atyp === 3) { // IPv6
+                const ipv6Buf = buffer.subarray(cursor, cursor + 16);
+                const ipv6Arr = [];
+                for (let i = 0; i < 16; i += 2) {
+                    ipv6Arr.push(ipv6Buf.readUInt16BE(i).toString(16));
+                }
+                remoteHost = ipv6Arr.join(':');
+                cursor += 16;
+            } else {
+                return ws.close();
+            }
 
-    let host = '';
-    if (addrType === 1) {
-      host = chunk.slice(cursor, cursor + 4).join('.');
-      cursor += 4;
-    } else if (addrType === 2) {
-      const domainLen = chunk[cursor];
-      cursor += 1;
-      host = chunk.slice(cursor, cursor + domainLen).toString('utf-8');
-      cursor += domainLen;
-    } else if (addrType === 3) {
-      host = chunk.slice(cursor, cursor + 16).reduce((acc, val, i) => {
-        return acc + (i % 2 === 0 && i > 0 ? ':' : '') + val.toString(16).padStart(2, '0');
-      }, '');
-      cursor += 16;
-    } else {
-      return ws.close();
-    }
+            // 返回 VLESS 响应头
+            ws.send(Buffer.from([version, 0]));
 
-    const initialPayload = chunk.slice(cursor);
+            // 建立双向 TCP 管道转发
+            const duplex = createWebSocketStream(ws);
+            const socket = net.connect({ host: remoteHost, port: remotePort }, () => {
+                const payload = buffer.subarray(cursor);
+                if (payload.length > 0) socket.write(payload);
+                duplex.pipe(socket);
+                socket.pipe(duplex);
+            });
 
-    // 返回 VLESS 响应头: [version, addonsLen]
-    ws.send(Buffer.from([version, 0]));
-
-    if (command === 1) {
-      // 建立出站 TCP 连接
-      tcpSocket = net.connect({ host, port }, () => {
-        if (initialPayload.length > 0) {
-          tcpSocket.write(initialPayload);
+            socket.on('error', () => ws.close());
+            duplex.on('error', () => socket.destroy());
+            ws.on('close', () => socket.destroy());
+        } catch (e) {
+            ws.close();
         }
-      });
-
-      tcpSocket.on('data', (data) => {
-        if (ws.readyState === ws.OPEN) {
-          ws.send(data);
-        }
-      });
-
-      tcpSocket.on('error', () => ws.close());
-      tcpSocket.on('close', () => ws.close());
-    } else {
-      // 暂不支持 UDP/Mux
-      ws.close();
-    }
-  });
-
-  ws.on('close', () => {
-    if (tcpSocket) tcpSocket.destroy();
-  });
-
-  ws.on('error', () => {
-    if (tcpSocket) tcpSocket.destroy();
-  });
+    });
 });
 
-server.listen(PORT, () => {
-  console.log(`VLESS Node 正在运行于端口: ${PORT}`);
+// 4.【必须在最后】开启端口监听
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`VLESS Node 正在运行于端口: ${PORT}`);
 });
