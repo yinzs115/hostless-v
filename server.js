@@ -2,9 +2,13 @@ const http = require('http');
 const net = require('net');
 const { WebSocketServer } = require('ws');
 
-// 环境变量获取，默认端口 8080
-const PORT = process.env.PORT || 8080;
-// 默认 UUID（部署时可在 Hostless 后台修改环境变量）
+// 获取平台注入的端口，若无则默认 8000
+const port = process.env.PORT || 8000;
+
+// 监听 0.0.0.0 保证外部网络能够通透
+server.listen(port, '0.0.0.0', () => {
+    console.log(`VLESS Node 正在运行于端口: ${port}`);
+});
 const RAW_UUID = process.env.UUID || 'd3b07384-d113-424a-a726-02232d00748b';
 const UUID = RAW_UUID.replaceAll('-', '');
 
