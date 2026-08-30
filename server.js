@@ -4,7 +4,7 @@ const { WebSocketServer, createWebSocketStream } = require('ws');
 
 // 1. 读取环境变量与配置
 const PORT = process.env.PORT || 8000;
-const UUID = (process.env.UUID || 'dbe32fa6-448f-42e5-9fb0-ab630714f409').replace(/-/g, '').toLowerCase();
+const UUID = (process.env.UUID || '').replace(/-/g, '').toLowerCase();
 
 // 2. 先创建 HTTP 服务（提供健康检查，防止平台杀死进程）
 const server = http.createServer((req, res) => {
